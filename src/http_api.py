@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload = {"error": exc.__class__.__name__, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -98,6 +102,28 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/resources":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    self._json(200, {"resources": service.list_resources(
+                        role, query.get("kind", [None])[0],
+                        query.get("status", [None])[0])})
+                elif path.startswith("/api/resources/"):
+                    resource_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_resource(resource_id, role))
+                elif path == "/api/assignments":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    item_id = query.get("item_id", [None])[0]
+                    resource_id = query.get("resource_id", [None])[0]
+                    self._json(200, {"assignments": service.list_assignments(
+                        role, int(item_id) if item_id else None,
+                        int(resource_id) if resource_id else None,
+                        query.get("status", [None])[0])})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +145,19 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/resources":
+                    self._json(201, service.register_resource(body, actor, role))
+                elif path.startswith("/api/resources/") and path.endswith("/status"):
+                    resource_id = int(path.split("/")[3])
+                    self._json(200, service.update_resource_status(
+                        resource_id, body, actor, role))
+                elif path == "/api/assignments":
+                    result = service.assign_resource(body, actor, role)
+                    self._json(200 if result.get("replayed") else 201, result)
+                elif path.startswith("/api/assignments/") and path.endswith("/release"):
+                    assignment_id = int(path.split("/")[3])
+                    self._json(200, service.release_assignment(
+                        assignment_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

@@ -3,6 +3,8 @@ from .domain import ConflictError, ValidationError
 TITLE='山火事件指挥与离线人员调度'; ENTITY='山火事件'; ID_PREFIX='WF'
 SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; TRANSITIONS={'reported': ['active'], 'active': ['contained'], 'contained': ['controlled'], 'controlled': ['closed'], 'closed': []}; TRANSITION_ROLES={'active': ['incident_commander'], 'contained': ['incident_commander'], 'controlled': ['incident_commander'], 'closed': ['incident_commander']}
 CREATE_ROLES=set(['field_commander']); RECORD_ROLES=set(['field_commander', 'logistics']); AUDIT_ROLES=set(['incident_commander', 'viewer']); VIEW_ROLES=set(['field_commander', 'incident_commander', 'logistics', 'viewer'])
+RESOURCE_ENTITY='应急资源'; ASSIGNMENT_ENTITY='资源分配'
+RESOURCE_ROLES=set(['logistics', 'incident_commander']); DISPATCH_ROLES=set(['field_commander', 'incident_commander']); RELEASE_ROLES=set(['incident_commander', 'logistics'])
 SEVERITY_WEIGHT={'low': 1.0, 'moderate': 3.0, 'high': 6.0, 'extreme': 9.0}; DEADLINE_HOURS={'low': 72, 'moderate': 24, 'high': 8, 'extreme': 4}; TERMINAL_STATES=set(['closed'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")

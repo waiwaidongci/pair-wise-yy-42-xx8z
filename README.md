@@ -31,8 +31,14 @@ python3 app.py --db ./data.db --port 8319
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
+- `POST /api/resources`，登记人员/车辆（编号、类型、状态）
+- `GET /api/resources`、`GET /api/resources/{id}`
+- `POST /api/resources/{id}/status`，可用/停用切换（占用中拒绝）
+- `POST /api/assignments`，按`request_ref`幂等派单；重复请求返回原分配，资源被占用时返回409及占用详情
+- `GET /api/assignments`
+- `POST /api/assignments/{id}/release`，手动释放（幂等）
 
-允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中。
+允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中：数据库以部分唯一索引保证同一资源同一时刻只有一条活跃分配，事件办结（closed）时在同一事务内自动释放其全部分配。
 
 ## 测试
 

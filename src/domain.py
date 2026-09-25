@@ -5,12 +5,13 @@ class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
 class DomainError(Exception):
     kind=ErrorKind.VALIDATION
-    def __init__(self,message): super().__init__(message); self.message=message
+    def __init__(self,message,details=None): super().__init__(message); self.message=message; self.details=details
 class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
 SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; ROLES=['field_commander', 'incident_commander', 'logistics', 'viewer']
+RESOURCE_KINDS=['personnel', 'vehicle']; RESOURCE_STATUSES=['available', 'assigned', 'maintenance']; ASSIGNMENT_STATUSES=['active', 'released']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
@@ -27,6 +28,9 @@ def require_text(value,field,max_length=2000):
     return value
 def normalize_severity(value):
     if value not in SEVERITIES: raise ValidationError("severity不在允许范围内")
+    return value
+def normalize_resource_kind(value):
+    if value not in RESOURCE_KINDS: raise ValidationError("kind必须是personnel或vehicle")
     return value
 def require_number(value,field,minimum=0.0):
     if isinstance(value,bool): raise ValidationError(f"{field}必须是数字")
