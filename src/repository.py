@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import (ALLOCATION_STATUSES, RESOURCE_STATUSES, ConflictError,
+                     NotFoundError)
 from .rules import ID_PREFIX, STATES
 
 
@@ -24,6 +25,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        resource_statuses = ",".join("'" + s + "'" for s in RESOURCE_STATUSES)
+        allocation_statuses = ",".join("'" + s + "'" for s in ALLOCATION_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -53,6 +56,42 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS resources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL CHECK(kind IN ('person','vehicle')),
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'available'
+                        CHECK(status IN ({resource_statuses})),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS allocations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_no TEXT NOT NULL UNIQUE,
+                    item_id INTEGER REFERENCES items(id),
+                    note TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ({allocation_statuses})),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    released_by TEXT,
+                    released_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS allocation_resources (
+                    allocation_id INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
+                    resource_id INTEGER NOT NULL REFERENCES resources(id),
+                    resource_code TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    PRIMARY KEY(allocation_id, resource_id)
+                );
+                CREATE TABLE IF NOT EXISTS resource_holds (
+                    resource_id INTEGER PRIMARY KEY REFERENCES resources(id),
+                    allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +195,215 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_resource(self, code: str, kind: str, rtype: str,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO resources(code, kind, type, status, created_by,
+                       created_at, updated_at) VALUES(?,?,?,?,?,?,?)""",
+                    (code, kind, rtype, "available", actor, now, now),
+                )
+                resource_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("资源编号已存在") from exc
+        return self.get_resource(resource_id)
+
+    def get_resource(self, resource_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM resources WHERE id=?", (resource_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("资源不存在")
+        return dict(row)
+
+    def get_resource_by_code(self, code: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM resources WHERE code=?", (code,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_resources(self, kind: Optional[str] = None,
+                       status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM resources"
+        clauses, params = [], []
+        if kind:
+            clauses.append("kind=?"); params.append(kind)
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def hold_map(self, resource_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not resource_ids:
+            return {}
+        marks = ",".join("?" for _ in resource_ids)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""SELECT h.resource_id AS resource_id, h.allocation_id AS allocation_id,
+                           a.request_no AS request_no, a.item_id AS item_id,
+                           a.created_by AS created_by, a.created_at AS created_at
+                    FROM resource_holds h JOIN allocations a ON a.id=h.allocation_id
+                    WHERE h.resource_id IN ({marks})""",
+                tuple(resource_ids),
+            ).fetchall()
+        return {int(row["resource_id"]): dict(row) for row in rows}
+
+    def find_allocation_by_request(self, request_no: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM allocations WHERE request_no=?", (request_no,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_allocation(self, allocation_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM allocations WHERE id=?", (allocation_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("分配单不存在")
+        return dict(row)
+
+    def allocation_resources(self, allocation_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT resource_id, resource_code, kind, type
+                   FROM allocation_resources WHERE allocation_id=? ORDER BY resource_id""",
+                (allocation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def allocate_resources(self, request_no: str, item_id: Optional[int], note: str,
+                           resources: List[Dict[str, Any]],
+                           actor: str) -> Dict[str, Any]:
+        """单事务完成幂等检查、占用检查、写占用；冲突抛ConflictError(带占用详情)。"""
+        now = utc_now()
+        ids = [int(r["id"]) for r in resources]
+        with self._lock, self.conn:
+            existing = self.conn.execute(
+                "SELECT * FROM allocations WHERE request_no=?", (request_no,)
+            ).fetchone()
+            if existing is not None:
+                return {"replayed": True, "allocation": dict(existing)}
+            marks = ",".join("?" for _ in ids)
+            held = self.conn.execute(
+                f"""SELECT r.id AS resource_id, r.code AS resource_code,
+                           h.allocation_id AS allocation_id, a.request_no AS request_no,
+                           a.item_id AS item_id, a.created_by AS created_by,
+                           a.created_at AS created_at
+                    FROM resources r
+                    JOIN resource_holds h ON h.resource_id=r.id
+                    JOIN allocations a ON a.id=h.allocation_id
+                    WHERE r.id IN ({marks})""",
+                tuple(ids),
+            ).fetchall()
+            if held:
+                details = {"occupied": [dict(row) for row in held]}
+                raise ConflictError("存在已被其他事件占用的资源", details)
+            cur = self.conn.execute(
+                """INSERT INTO allocations(request_no, item_id, note, status,
+                   created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (request_no, item_id, note, "active", actor, now),
+            )
+            allocation_id = int(cur.lastrowid)
+            self.conn.executemany(
+                """INSERT INTO allocation_resources(allocation_id, resource_id,
+                   resource_code, kind, type) VALUES(?,?,?,?,?)""",
+                [(allocation_id, r["id"], r["code"], r["kind"], r["type"])
+                 for r in resources],
+            )
+            self.conn.executemany(
+                "INSERT INTO resource_holds(resource_id, allocation_id, created_at) VALUES(?,?,?)",
+                [(r["id"], allocation_id, now) for r in resources],
+            )
+            self.conn.executemany(
+                "UPDATE resources SET status='occupied', updated_at=? WHERE id=?",
+                [(now, r["id"]) for r in resources],
+            )
+            allocation = self.get_allocation(allocation_id)
+        return {"replayed": False, "allocation": allocation}
+
+    def release_allocation(self, allocation_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            allocation = self.conn.execute(
+                "SELECT * FROM allocations WHERE id=?", (allocation_id,)
+            ).fetchone()
+            if allocation is None:
+                raise NotFoundError("分配单不存在")
+            if allocation["status"] == "released":
+                return {"replayed": True, "allocation": dict(allocation)}
+            self.conn.execute(
+                """UPDATE allocations SET status='released', released_by=?,
+                   released_at=? WHERE id=? AND status='active'""",
+                (actor, now, allocation_id),
+            )
+            self.conn.execute(
+                "DELETE FROM resource_holds WHERE allocation_id=?",
+                (allocation_id,),
+            )
+            self.conn.execute(
+                """UPDATE resources SET status='available', updated_at=?
+                   WHERE id IN (SELECT resource_id FROM allocation_resources
+                                WHERE allocation_id=?)
+                     AND id NOT IN (SELECT resource_id FROM resource_holds)""",
+                (now, allocation_id),
+            )
+            allocation = self.get_allocation(allocation_id)
+        return {"replayed": False, "allocation": allocation}
+
+    def release_for_item(self, item_id: int, actor: str) -> List[int]:
+        now = utc_now()
+        released: List[int] = []
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT id FROM allocations WHERE item_id=? AND status='active'",
+                (item_id,),
+            ).fetchall()
+            for row in rows:
+                allocation_id = int(row["id"])
+                released.append(allocation_id)
+                self.conn.execute(
+                    """UPDATE allocations SET status='released', released_by=?,
+                       released_at=? WHERE id=?""",
+                    (actor, now, allocation_id),
+                )
+                self.conn.execute(
+                    "DELETE FROM resource_holds WHERE allocation_id=?",
+                    (allocation_id,),
+                )
+                self.conn.execute(
+                    """UPDATE resources SET status='available', updated_at=?
+                       WHERE id IN (SELECT resource_id FROM allocation_resources
+                                    WHERE allocation_id=?)
+                         AND id NOT IN (SELECT resource_id FROM resource_holds)""",
+                    (now, allocation_id),
+                )
+        return released
+
+    def list_allocations(self, status: Optional[str] = None,
+                         item_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM allocations"
+        clauses, params = [], []
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if item_id is not None:
+            clauses.append("item_id=?"); params.append(item_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

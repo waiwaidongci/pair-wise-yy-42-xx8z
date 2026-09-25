@@ -9,8 +9,15 @@ class DomainError(Exception):
 class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
-class ConflictError(DomainError): kind=ErrorKind.CONFLICT
+class ConflictError(DomainError):
+    kind=ErrorKind.CONFLICT
+    def __init__(self,message,details=None):
+        super().__init__(message); self.message=message; self.details=details
 SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; ROLES=['field_commander', 'incident_commander', 'logistics', 'viewer']
+RESOURCE_KINDS=['person', 'vehicle']
+RESOURCE_TYPES={'person': ['commander', 'firefighter', 'driver', 'medic', 'signal'], 'vehicle': ['engine', 'tanker', 'carrier', 'command', 'rescue']}
+RESOURCE_STATUSES=['available', 'occupied']
+ALLOCATION_STATUSES=['active', 'released']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
@@ -36,3 +43,10 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+def normalize_resource_kind(value):
+    if value not in RESOURCE_KINDS: raise ValidationError("资源kind必须是person或vehicle")
+    return value
+def normalize_resource_type(kind,value):
+    allowed=RESOURCE_TYPES.get(kind,[])
+    if value not in allowed: raise ValidationError(f"{kind}的type必须是: {','.join(allowed)}")
+    return value

@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload: Dict[str, Any] = {
+                "error": exc.__class__.__name__, "message": str(exc)}
+            if isinstance(exc, ConflictError) and getattr(exc, "details", None):
+                payload["details"] = exc.details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -84,6 +88,36 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path == "/api/resources":
+                    actor, role = self._identity()
+                    query = parse_qs(urlparse(self.path).query)
+                    kind = query.get("kind", [None])[0]
+                    status = query.get("status", [None])[0]
+                    del actor
+                    self._json(200, {"resources": service.list_resources(
+                        role, kind, status)})
+                elif path.startswith("/api/resources/"):
+                    key = path.rsplit("/", 1)[-1]
+                    actor, role = self._identity()
+                    del actor
+                    if key.isdigit():
+                        self._json(200, service.get_resource(int(key), role))
+                    else:
+                        self._json(200, service.get_resource_by_code(key, role))
+                elif path == "/api/allocations":
+                    actor, role = self._identity()
+                    query = parse_qs(urlparse(self.path).query)
+                    status = query.get("status", [None])[0]
+                    item_param = query.get("item_id", [None])[0]
+                    item_id = int(item_param) if item_param is not None else None
+                    del actor
+                    self._json(200, {"allocations": service.list_allocations(
+                        role, status, item_id)})
+                elif path.startswith("/api/allocations/"):
+                    allocation_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_allocation(allocation_id, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -110,6 +144,13 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/resources":
+                    self._json(201, service.register_resource(body, actor, role))
+                elif path == "/api/allocations":
+                    self._json(201, service.allocate(body, actor, role))
+                elif path.startswith("/api/allocations/") and path.endswith("/release"):
+                    allocation_id = int(path.split("/")[3])
+                    self._json(200, service.release(allocation_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
